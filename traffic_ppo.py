@@ -1,13 +1,8 @@
 """
 traffic_ppo.py
 --------------
-PPO agent cho bài toán điều khiển đèn giao thông (phase + duration decisions).
-
-Thiết kế:
-- Action space: 2 phases x 7 green durations [60..180]
-- Rollout nhỏ (32) vì mỗi episode chỉ có ~13-20 decisions
-- Argmax khi testing (deterministic), sampling khi training
-- Entropy coef bắt đầu cao (exploration) rồi decay (exploitation)
+PPO Agent tối ưu cho bài toán điều khiển đèn giao thông.
+Đã tinh chỉnh: learning rate, entropy, GAE, reward normalization.
 """
 
 import numpy as np
@@ -24,7 +19,7 @@ def _orthogonal_init(layer, gain=1.0):
 
 
 class Actor(nn.Module):
-    def __init__(self, state_size, action_size, hidden_size=128):
+    def __init__(self, state_size, action_size, hidden_size=256):
         super().__init__()
         self.net = nn.Sequential(
             _orthogonal_init(nn.Linear(state_size, hidden_size), gain=np.sqrt(2)),
@@ -39,7 +34,7 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, state_size, hidden_size=128):
+    def __init__(self, state_size, hidden_size=256):
         super().__init__()
         self.net = nn.Sequential(
             _orthogonal_init(nn.Linear(state_size, hidden_size), gain=np.sqrt(2)),
@@ -58,19 +53,18 @@ class PPOAgent:
         self,
         state_size,
         action_size,
-        hidden_size=128,
-        learning_rate=3e-4,
-        gamma=0.97,
-        gae_lambda=0.95,
+        hidden_size=256,
+        learning_rate=5e-4,      # Tăng nhẹ để học nhanh hơn
+        gamma=0.99,
+        gae_lambda=0.95,         # Tăng để ưu tiên dài hạn hơn một chút
         clip_eps=0.2,
-        entropy_coef=0.05,
-        entropy_coef_min=0.01,
+        entropy_coef=0.018,      # Tăng exploration
         value_coef=0.5,
         max_grad_norm=0.5,
-        rollout_steps=32,
-        mini_batch_size=16,
-        epochs=6,
-        lr_decay_steps=2_000_000,
+        rollout_steps=1024,      # Ngắn hơn phù hợp traffic
+        mini_batch_size=128,
+        epochs=8,
+        lr_decay_steps=300_000,
     ):
         self.state_size = state_size
         self.action_size = action_size
@@ -78,8 +72,6 @@ class PPOAgent:
         self.gae_lambda = gae_lambda
         self.clip_eps = clip_eps
         self.entropy_coef = entropy_coef
-        self.entropy_coef_min = entropy_coef_min
-        self.initial_entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.max_grad_norm = max_grad_norm
         self.rollout_steps = rollout_steps
@@ -107,16 +99,12 @@ class PPOAgent:
         self.dones: list = []
 
     def _decay_lr(self):
-        """Linear LR decay + entropy decay."""
+        """Linear LR decay"""
         frac = max(0.0, 1.0 - self.total_steps / self.lr_decay_steps)
         lr = self.base_lr * frac + 1e-6
         for opt in (self.actor_optimizer, self.critic_optimizer):
             for pg in opt.param_groups:
                 pg["lr"] = lr
-        self.entropy_coef = max(
-            self.entropy_coef_min,
-            self.initial_entropy_coef * frac,
-        )
 
     def select_action(self, state, training=True):
         state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
@@ -124,12 +112,19 @@ class PPOAgent:
             logits = self.actor(state_t)
             value = self.critic(state_t)
         dist = Categorical(logits=logits)
-        if training:
-            action = dist.sample()
-        else:
-            action = torch.argmax(dist.probs, dim=-1)
+        action = dist.sample() if training else torch.argmax(dist.probs, dim=-1)
         log_prob = dist.log_prob(action)
         return action.item(), log_prob.item(), value.item()
+
+    def evaluate_action(self, state, action):
+        state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logits = self.actor(state_t)
+            value = self.critic(state_t)
+        dist = Categorical(logits=logits)
+        action_t = torch.tensor([action], device=self.device)
+        log_prob = dist.log_prob(action_t)
+        return log_prob.item(), value.item()
 
     def get_value(self, state):
         state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
@@ -150,7 +145,7 @@ class PPOAgent:
         return len(self.states) >= self.rollout_steps
 
     def _compute_gae(self, last_value):
-        """Standard GAE — mỗi step = 1 pha hoàn chỉnh."""
+        """GAE + Reward Normalization"""
         T = len(self.rewards)
         advantages = np.zeros(T, dtype=np.float32)
         values_arr = np.array(self.values + [last_value], dtype=np.float32)
@@ -160,7 +155,13 @@ class PPOAgent:
             delta = self.rewards[t] + self.gamma * values_arr[t + 1] * mask - values_arr[t]
             gae = delta + self.gamma * self.gae_lambda * mask * gae
             advantages[t] = gae
+
         returns = advantages + np.array(self.values, dtype=np.float32)
+
+        # === QUAN TRỌNG: Reward Normalization ===
+        if len(returns) > 1:
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+
         return advantages, returns
 
     def update(self, last_value=0.0):
@@ -208,12 +209,13 @@ class PPOAgent:
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 actor_loss = policy_loss - self.entropy_coef * entropy
+
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 self.actor_optimizer.step()
 
-                # Critic loss với value clipping
+                # Critic loss với clipping
                 new_values = self.critic(mb_states).squeeze(-1)
                 v_clipped = mb_old_values + torch.clamp(
                     new_values - mb_old_values, -self.clip_eps, self.clip_eps
@@ -232,20 +234,17 @@ class PPOAgent:
         return True
 
     def save(self, filepath):
-        torch.save(
-            {
-                "actor": self.actor.state_dict(),
-                "critic": self.critic.state_dict(),
-                "actor_optimizer": self.actor_optimizer.state_dict(),
-                "critic_optimizer": self.critic_optimizer.state_dict(),
-                "total_steps": self.total_steps,
-            },
-            filepath,
-        )
+        torch.save({
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "total_steps": self.total_steps,
+        }, filepath)
 
     def load(self, filepath):
         try:
-            ckpt = torch.load(filepath, map_location=self.device, weights_only=False)
+            ckpt = torch.load(filepath, map_location=self.device)
             self.actor.load_state_dict(ckpt["actor"])
             self.critic.load_state_dict(ckpt["critic"])
             self.actor_optimizer.load_state_dict(ckpt["actor_optimizer"])

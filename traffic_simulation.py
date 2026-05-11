@@ -114,8 +114,10 @@ class Simulation:
             car.update(is_green, ahead)
 
         self._remove_done()
-        self.tld.update(self.tl)
-        self.hud.update(self.tl, self.cars, self.frame)
+        if hasattr(self, 'tld') and self.tld:
+            self.tld.update(self.tl)
+        if hasattr(self, 'hud') and self.hud:
+            self.hud.update(self.tl, self.cars, self.frame)
 
 
 class SimulationRL:
@@ -179,7 +181,9 @@ class SimulationRL:
                     break
                 color = self.rng.choice(CAR_COLORS[d])
                 car = Car(d, color)
-                car.add_to_ax(self.ax)
+                # Chỉ add_to_ax nếu có trục đồ họa (không headless)
+                if hasattr(self, 'ax') and self.ax:
+                    car.add_to_ax(self.ax)
                 self.cars.append(car)
 
     def _cars_ahead(self, car: Car):
@@ -240,8 +244,11 @@ class SimulationRL:
         else:
             self.tl.tick()
 
-        self.tld.update(self.tl)
-        self.hud.update(self.tl, self.cars, self.frame)
+        # Cập nhật hiển thị nếu có đối tượng đồ họa
+        if hasattr(self, 'tld') and self.tld:
+            self.tld.update(self.tl)
+        if hasattr(self, 'hud') and self.hud:
+            self.hud.update(self.tl, self.cars, self.frame)
         return self.episode_reward
 
     def save_model(self):
@@ -278,7 +285,6 @@ class SimulationBenchmark:
         self.total_cars_passed = 0
         self.total_wait_time = {"N": 0, "S": 0, "E": 0, "W": 0}
         self.total_queue_length = {"N": 0, "S": 0, "E": 0, "W": 0}
-        self.total_wait_time_completed = 0.0  # Tổng wait_time của xe đã đi qua
         self.phase_switches = 0
         self.prev_phase = 0
         self.episode_reward = 0
@@ -355,9 +361,8 @@ class SimulationBenchmark:
 
     def _remove_done(self):
         to_remove = [c for c in self.cars if c.state == "done"]
-        for c in to_remove:
+        for _ in to_remove:
             self.total_cars_passed += 1
-            self.total_wait_time_completed += c.wait_time
         self.cars = [c for c in self.cars if c.state != "done"]
         return len(to_remove)
 
@@ -381,14 +386,15 @@ class SimulationBenchmark:
         self.queue_length_history.append(sum(queue.values()))
         self.waiting_cars_history.append(sum(waiting.values()))
 
-        # Tính phase hiện tại cho cả Fixed và PPO
+        current_phase = None
         if hasattr(self.tl, "phase"):
             current_phase = self.tl.phase
-        else:
-            # Fixed Timing: suy ra phase từ trạng thái đèn
-            current_phase = 0 if self.tl.get("N") in ("green", "yellow") else 1
-
-        if current_phase != self.prev_phase:
+        elif hasattr(self.tl, "get"):
+            # For Fixed Timing, deduce phase from NS green/yellow
+            ns_state = self.tl.get("N")
+            current_phase = 0 if ns_state in ("green", "yellow") else 1
+            
+        if current_phase is not None and self.prev_phase != current_phase:
             self.phase_switches += 1
             self.prev_phase = current_phase
 
@@ -437,7 +443,6 @@ class SimulationBenchmark:
         avg_waiting = sum(self.total_wait_time.values()) / max(frames, 1)
         max_queue = max(self.queue_length_history) if self.queue_length_history else 0
         max_waiting = max(self.waiting_cars_history) if self.waiting_cars_history else 0
-        avg_wait_per_car = self.total_wait_time_completed / max(self.total_cars_passed, 1)
 
         return {
             "algorithm": "PPO" if self.use_rl else "Fixed Timing",
@@ -449,7 +454,6 @@ class SimulationBenchmark:
             "max_queue": max_queue,
             "avg_waiting_cars": avg_waiting,
             "max_waiting": max_waiting,
-            "avg_wait_per_car": avg_wait_per_car,
             "phase_switches": self.phase_switches,
             "avg_phase_duration": frames / max(self.phase_switches, 1),
             "total_reward": self.episode_reward if self.use_rl else None,
@@ -505,9 +509,9 @@ def main_dqn_train():
     sim = SimulationRL(use_rl=True, training=True, model_path=checkpoint_path)
     sim.setup(fig, ax)
 
-    score_window = 300
-    eval_interval = 200
-    warmup_frames = 1000
+    score_window = 400
+    eval_interval = 500
+    warmup_frames = 3000
     recent_queue = deque(maxlen=score_window)
     recent_waiting = deque(maxlen=score_window)
     recent_throughput = deque(maxlen=score_window)
@@ -515,6 +519,7 @@ def main_dqn_train():
     best_score = -float("inf")
     best_frame = -1
     best_saved = False
+    switch_counts = {"AGENT": 0, "SOFT_FORCE": 0, "HARD_FORCE": 0, "FORCE": 0}
     total_switches = 0
     last_switch_frame = 0
     avg_phase_len = 0.0
@@ -576,20 +581,13 @@ def main_dqn_train():
         recent_waiting.append(waiting_now)
         recent_queue.append(queue_now)
 
-        from traffic_rl import GREEN_DURATIONS
-        if sim.tl.last_action is not None:
-            phase_idx = sim.tl.last_action // len(GREEN_DURATIONS)
-            duration_idx = sim.tl.last_action % len(GREEN_DURATIONS)
-            phase_str = "NS" if phase_idx == 0 else "EW"
-            action_str = f"P={phase_str},G={GREEN_DURATIONS[duration_idx]}"
-        else:
-            action_str = "N/A"
-        if sim.tl.last_switch_reason == "AUTO":
+        action_str = "N/A" if sim.tl.last_action is None else ("KEEP" if sim.tl.last_action == 0 else "SWITCH")
+        if sim.tl.last_switch_reason in switch_counts:
+            switch_counts[sim.tl.last_switch_reason] += 1
             total_switches += 1
             phase_len = frame - last_switch_frame
             last_switch_frame = frame
-            if total_switches > 0:
-                avg_phase_len = ((avg_phase_len * (total_switches - 1)) + phase_len) / total_switches
+            avg_phase_len = ((avg_phase_len * (total_switches - 1)) + phase_len) / total_switches
 
         current_score = float("nan")
         if len(recent_throughput) >= score_window:
@@ -611,14 +609,16 @@ def main_dqn_train():
 
         score_text = f"{current_score:.2f}" if not np.isnan(current_score) else "warming"
         best_text = f"{best_score:.2f}@{best_frame}" if best_frame >= 0 else "N/A"
+        agent_pct = (switch_counts["AGENT"] / total_switches * 100.0) if total_switches > 0 else 0.0
         rl_text.set_text(
             f"PPO Training\n"
             f"Reward: {reward:.1f}\n"
             f"Passed: {sim.total_cars_passed}\n"
             f"Phase: {'NS' if sim.tl.phase == 0 else 'EW'}\n"
-            f"Green: {sim.tl.chosen_green} ({sim.tl.time_in_phase}/{sim.tl.chosen_green})\n"
+            f"Time: {sim.tl.time_in_phase}/{sim.tl.MAX_GREEN_TIME} (hard {sim.tl.HARD_MAX_GREEN_TIME})\n"
             f"Action: {action_str}\n"
-            f"Switches: {total_switches}\n"
+            f"Switch: {sim.tl.last_switch_reason}\n"
+            f"Switches: {total_switches} (agent {agent_pct:.1f}%)\n"
             f"Avg phase: {avg_phase_len:.1f} fr\n"
             f"Score: {score_text}\n"
             f"Best : {best_text}"
@@ -685,6 +685,7 @@ def main_dqn_test(model_path="ppo_model.pth"):
         bbox=dict(facecolor="#000000aa", edgecolor="#00ffff22", boxstyle="round,pad=0.5"),
         zorder=20,
     )
+    switch_counts = {"AGENT": 0, "SOFT_FORCE": 0, "HARD_FORCE": 0, "FORCE": 0}
     total_switches = 0
     last_switch_frame = 0
     avg_phase_len = 0.0
@@ -692,28 +693,23 @@ def main_dqn_test(model_path="ppo_model.pth"):
     def animate(frame):
         nonlocal total_switches, last_switch_frame, avg_phase_len
         reward = sim.step()
-        from traffic_rl import GREEN_DURATIONS
-        if sim.tl.last_action is not None:
-            phase_idx = sim.tl.last_action // len(GREEN_DURATIONS)
-            duration_idx = sim.tl.last_action % len(GREEN_DURATIONS)
-            phase_str = "NS" if phase_idx == 0 else "EW"
-            action_str = f"P={phase_str},G={GREEN_DURATIONS[duration_idx]}"
-        else:
-            action_str = "N/A"
-        if sim.tl.last_switch_reason == "AUTO":
+        action_str = "N/A" if sim.tl.last_action is None else ("KEEP" if sim.tl.last_action == 0 else "SWITCH")
+        if sim.tl.last_switch_reason in switch_counts:
+            switch_counts[sim.tl.last_switch_reason] += 1
             total_switches += 1
             phase_len = frame - last_switch_frame
             last_switch_frame = frame
-            if total_switches > 0:
-                avg_phase_len = ((avg_phase_len * (total_switches - 1)) + phase_len) / total_switches
+            avg_phase_len = ((avg_phase_len * (total_switches - 1)) + phase_len) / total_switches
+        agent_pct = (switch_counts["AGENT"] / total_switches * 100.0) if total_switches > 0 else 0.0
         rl_text.set_text(
             f"PPO Trained\n"
             f"Reward: {reward:.1f}\n"
             f"Passed: {sim.total_cars_passed}\n"
             f"Phase: {'NS' if sim.tl.phase == 0 else 'EW'}\n"
-            f"Green: {sim.tl.chosen_green} ({sim.tl.time_in_phase}/{sim.tl.chosen_green})\n"
+            f"Time: {sim.tl.time_in_phase}/{sim.tl.MAX_GREEN_TIME} (hard {sim.tl.HARD_MAX_GREEN_TIME})\n"
             f"Action: {action_str}\n"
-            f"Switches: {total_switches}\n"
+            f"Switch: {sim.tl.last_switch_reason}\n"
+            f"Switches: {total_switches} (agent {agent_pct:.1f}%)\n"
             f"Avg phase: {avg_phase_len:.1f} fr"
         )
         return []
@@ -796,7 +792,6 @@ def run_comparison(model_path="ppo_model.pth", dqn_label="PPO", seed=42):
     print(f"{'Độ dài hàng đợi TB':<30} {results_fixed['avg_queue_length']:>18.2f} {results_dqn['avg_queue_length']:>18.2f}")
     print(f"{'Độ dài hàng đợi max':<30} {results_fixed['max_queue']:>18} {results_dqn['max_queue']:>18}")
     print(f"{'Xe đang chờ TB':<30} {results_fixed['avg_waiting_cars']:>18.2f} {results_dqn['avg_waiting_cars']:>18.2f}")
-    print(f"{'TG chờ TB/xe (frames)':<30} {results_fixed['avg_wait_per_car']:>18.1f} {results_dqn['avg_wait_per_car']:>18.1f}")
     print(f"{'Số lần chuyển phase':<30} {results_fixed['phase_switches']:>18} {results_dqn['phase_switches']:>18}")
     print(f"{'Thời gian phase TB':<30} {results_fixed['avg_phase_duration']:>18.1f} {results_dqn['avg_phase_duration']:>18.1f}")
     if results_dqn['total_reward'] is not None:
@@ -817,10 +812,6 @@ def run_comparison(model_path="ppo_model.pth", dqn_label="PPO", seed=42):
     wait_diff = results_fixed['avg_waiting_cars'] - results_dqn['avg_waiting_cars']
     wait_pct = (wait_diff / max(results_fixed['avg_waiting_cars'], 0.001)) * 100
     print(f"• Xe chờ TB: {dqn_label} {'giảm' if wait_diff > 0 else 'tăng'} {abs(wait_pct):.1f}%")
-
-    wait_per_car_diff = results_fixed['avg_wait_per_car'] - results_dqn['avg_wait_per_car']
-    wait_per_car_pct = (wait_per_car_diff / max(results_fixed['avg_wait_per_car'], 0.001)) * 100
-    print(f"• ★ TG chờ TB/xe: {dqn_label} {'giảm' if wait_per_car_diff > 0 else 'tăng'} {abs(wait_per_car_pct):.1f}% (MỤC TIÊU CHÍNH)")
 
     print(f"• Số lần chuyển phase: Fixed={results_fixed['phase_switches']}, {dqn_label}={results_dqn['phase_switches']}")
     if results_dqn['phase_switches'] > results_fixed['phase_switches']:
@@ -896,7 +887,6 @@ def run_comparison_multi_seed(model_path="ppo_model.pth", dqn_label="PPO", seeds
             "throughput_rate": mean([r["throughput_rate"] for r in results]),
             "avg_queue_length": mean([r["avg_queue_length"] for r in results]),
             "avg_waiting_cars": mean([r["avg_waiting_cars"] for r in results]),
-            "avg_wait_per_car": mean([r["avg_wait_per_car"] for r in results]),
             "cars_spawned": mean([r["cars_spawned"] for r in results]),
             "cars_passed": mean([r["cars_passed"] for r in results]),
         }
@@ -914,7 +904,6 @@ def run_comparison_multi_seed(model_path="ppo_model.pth", dqn_label="PPO", seeds
     print(f"{'Throughput (xe/phút)':<30} {fixed_mean['throughput_rate']:>18.2f} {dqn_mean['throughput_rate']:>18.2f}")
     print(f"{'Độ dài hàng đợi TB':<30} {fixed_mean['avg_queue_length']:>18.2f} {dqn_mean['avg_queue_length']:>18.2f}")
     print(f"{'Xe đang chờ TB':<30} {fixed_mean['avg_waiting_cars']:>18.2f} {dqn_mean['avg_waiting_cars']:>18.2f}")
-    print(f"{'★ TG chờ TB/xe (frames)':<30} {fixed_mean['avg_wait_per_car']:>18.1f} {dqn_mean['avg_wait_per_car']:>18.1f}")
     print("=" * 70)
 
 

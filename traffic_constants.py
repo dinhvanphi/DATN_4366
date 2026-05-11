@@ -15,10 +15,10 @@ STOP_GAP = 0.55
 SAFE_GAP = 0.7
 SPAWN_BLOCK_DIST = 0.8
 
+# Giảm GREEN_TIME để Fixed Timing switch nhiều hơn → so sánh công bằng hơn
 GREEN_TIME = 120
-YELLOW_TIME = 10   # Đủ thời gian xe thoát + đồng bộ với traffic_rl.py
-ALL_RED_TIME = 12  # Xóa sạch ngã tư trước khi đổi pha
-RED_TIME = GREEN_TIME + YELLOW_TIME + ALL_RED_TIME
+YELLOW_TIME = 20   # Giảm từ 40 → giảm overhead mỗi lần PPO switch
+RED_TIME = GREEN_TIME + YELLOW_TIME
 
 CAR_W, CAR_H = 0.55, 0.9
 
@@ -42,6 +42,17 @@ STOP_LINE = {
     "S": CENTER - INTER / 2,
     "E": CENTER + INTER / 2,
     "W": CENTER - INTER / 2,
+}
+
+# Xác suất sinh xe mỗi frame (60 fps)
+# KỊCH BẢN GIỜ CAO ĐIỂM (Bất đối xứng)
+# Trục Bắc-Nam (Đường chính): Xe rất đông
+# Trục Đông-Tây (Đường phụ): Xe rất vắng
+SPAWN_PROBS = {
+    "N": 0.018,
+    "S": 0.018,
+    "E": 0.004,
+    "W": 0.004
 }
 
 LANE_X = {
