@@ -37,6 +37,7 @@ from traffic_constants import (
     GREEN_TIME,
     YELLOW_TIME,
     RED_TIME,
+    ALL_RED_TIME,
 )
 
 
@@ -264,14 +265,14 @@ class TrafficLight:
 
     def __init__(self):
         self.frame = 0
-        self.cycle = GREEN_TIME + YELLOW_TIME + RED_TIME
-        self.full = GREEN_TIME + YELLOW_TIME
+        # Một chu kỳ = (Xanh + Vàng + Đỏ Toàn Bộ) * 2
+        self.cycle_half = GREEN_TIME + YELLOW_TIME + ALL_RED_TIME
 
     def tick(self):
         self.frame += 1
 
     def _phase_ns(self):
-        t = self.frame % (self.full * 2)
+        t = self.frame % (self.cycle_half * 2)
         if t < GREEN_TIME:
             return "green"
         if t < GREEN_TIME + YELLOW_TIME:
@@ -279,7 +280,8 @@ class TrafficLight:
         return "red"
 
     def _phase_ew(self):
-        t = (self.frame + self.full) % (self.full * 2)
+        # Lệch một nửa chu kỳ
+        t = (self.frame + self.cycle_half) % (self.cycle_half * 2)
         if t < GREEN_TIME:
             return "green"
         if t < GREEN_TIME + YELLOW_TIME:

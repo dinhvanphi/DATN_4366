@@ -54,15 +54,15 @@ class PPOAgent:
         state_size,
         action_size,
         hidden_size=256,
-        learning_rate=5e-4,      # Tăng nhẹ để học nhanh hơn
+        learning_rate=3e-4,
         gamma=0.99,
-        gae_lambda=0.95,         # Tăng để ưu tiên dài hạn hơn một chút
+        gae_lambda=0.95,
         clip_eps=0.2,
-        entropy_coef=0.018,      # Tăng exploration
+        entropy_coef=0.010,
         value_coef=0.5,
         max_grad_norm=0.5,
-        rollout_steps=1024,      # Ngắn hơn phù hợp traffic
-        mini_batch_size=128,
+        rollout_steps=128,
+        mini_batch_size=64,
         epochs=8,
         lr_decay_steps=300_000,
     ):
@@ -145,7 +145,7 @@ class PPOAgent:
         return len(self.states) >= self.rollout_steps
 
     def _compute_gae(self, last_value):
-        """GAE + Reward Normalization"""
+        """Tính GAE trên reward đã được shaping ở môi trường."""
         T = len(self.rewards)
         advantages = np.zeros(T, dtype=np.float32)
         values_arr = np.array(self.values + [last_value], dtype=np.float32)
@@ -157,10 +157,6 @@ class PPOAgent:
             advantages[t] = gae
 
         returns = advantages + np.array(self.values, dtype=np.float32)
-
-        # === QUAN TRỌNG: Reward Normalization ===
-        if len(returns) > 1:
-            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         return advantages, returns
 

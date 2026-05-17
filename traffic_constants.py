@@ -18,7 +18,8 @@ SPAWN_BLOCK_DIST = 0.8
 # Giảm GREEN_TIME để Fixed Timing switch nhiều hơn → so sánh công bằng hơn
 GREEN_TIME = 120
 YELLOW_TIME = 20   # Giảm từ 40 → giảm overhead mỗi lần PPO switch
-RED_TIME = GREEN_TIME + YELLOW_TIME
+ALL_RED_TIME = 4
+RED_TIME = GREEN_TIME + YELLOW_TIME + ALL_RED_TIME
 
 CAR_W, CAR_H = 0.55, 0.9
 

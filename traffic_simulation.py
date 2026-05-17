@@ -18,6 +18,36 @@ from traffic_entities import Car, DemandController, HUD, TrafficLight, TrafficLi
 from traffic_rl import TrafficLightRL
 
 
+BENCHMARK_MAX_FRAMES = 2000
+BENCHMARK_SPAWN_BASE_PROB = {"N": 0.010, "S": 0.010, "E": 0.012, "W": 0.012}
+BENCHMARK_SPAWN_BURST_PROB = 0.030
+BENCHMARK_SPAWN_MAX_BURST = 3
+
+
+def build_benchmark_spawn_schedule(seed, max_frames=BENCHMARK_MAX_FRAMES):
+    """Tạo lịch yêu cầu spawn cố định để benchmark Fixed và PPO công bằng."""
+    rng = random.Random(seed)
+    demand = DemandController(rng=rng)
+    schedule = []
+
+    for _ in range(max_frames):
+        demand.tick()
+        frame_counts = {}
+        for direction in ("N", "S", "E", "W"):
+            p_base = demand.base_prob(direction, BENCHMARK_SPAWN_BASE_PROB)
+            p_burst = demand.burst_prob(direction, BENCHMARK_SPAWN_BURST_PROB)
+            count = 0
+            if rng.random() < p_base:
+                count += 1
+            if rng.random() < p_burst:
+                count += rng.randint(1, BENCHMARK_SPAWN_MAX_BURST)
+            if count:
+                frame_counts[direction] = min(count, BENCHMARK_SPAWN_MAX_BURST)
+        schedule.append(frame_counts)
+
+    return schedule
+
+
 class Simulation:
     def __init__(self, rng=None):
         self.rng = rng or random.Random()
@@ -121,16 +151,17 @@ class Simulation:
 
 
 class SimulationRL:
-    """Simulation sử dụng PPO để điều khiển đèn giao thông."""
+    """Simulation sử dụng RL để điều khiển đèn giao thông."""
 
-    def __init__(self, use_rl=True, training=True, model_path="ppo_model.pth", rng=None):
+    def __init__(self, use_rl=True, training=True, model_path="ppo_model.pth", rng=None, algorithm="ppo"):
         self.rng = rng or random.Random()
         self.use_rl = use_rl
         self.training = training
         self.model_path = model_path
+        self.algorithm = algorithm.lower()
 
         if use_rl:
-            self.tl = TrafficLightRL(use_rl=True)
+            self.tl = TrafficLightRL(use_rl=True, algorithm=self.algorithm)
             if not training:
                 loaded = self.tl.agent.load(model_path)
                 if not loaded:
@@ -147,6 +178,7 @@ class SimulationRL:
 
         self.episode_reward = 0
         self.total_cars_passed = 0
+        self.total_red_wait_time_passed = 0.0
         self.avg_wait_time = 0
 
     def _can_spawn(self, direction):
@@ -203,6 +235,7 @@ class SimulationRL:
 
     def _remove_done(self):
         to_remove = [c for c in self.cars if c.state == "done"]
+        self.total_red_wait_time_passed += sum(c.wait_time for c in to_remove)
         for c in to_remove:
             try:
                 c.remove()
@@ -257,17 +290,19 @@ class SimulationRL:
 
 
 class SimulationBenchmark:
-    """Benchmark để so sánh Fixed Timing và PPO trong cùng điều kiện spawn."""
+    """Benchmark để so sánh Fixed Timing và RL trong cùng điều kiện spawn."""
 
-    def __init__(self, use_rl=False, model_path="ppo_model.pth", max_frames=2000, rng=None, spawn_schedule=None):
+    def __init__(self, use_rl=False, model_path="ppo_model.pth", max_frames=2000,
+                 rng=None, spawn_schedule=None, algorithm="ppo"):
         self.rng = rng or random.Random()
         self.use_rl = use_rl
+        self.algorithm = algorithm.lower()
         self.max_frames = max_frames
         self.spawn_schedule = spawn_schedule
         self.pending_spawns = {"N": 0, "S": 0, "E": 0, "W": 0}
 
         if use_rl:
-            self.tl = TrafficLightRL(use_rl=True)
+            self.tl = TrafficLightRL(use_rl=True, algorithm=self.algorithm)
             loaded = self.tl.agent.load(model_path)
             if not loaded:
                 raise RuntimeError(f"Không load được model từ {model_path}")
@@ -282,9 +317,12 @@ class SimulationBenchmark:
         self.demand = DemandController(rng=self.rng)
 
         self.total_cars_spawned = 0
+        self.total_spawn_requested = 0
         self.total_cars_passed = 0
+        self.total_red_wait_time_passed = 0.0
         self.total_wait_time = {"N": 0, "S": 0, "E": 0, "W": 0}
         self.total_queue_length = {"N": 0, "S": 0, "E": 0, "W": 0}
+        self.total_internal_queue_length = {"N": 0, "S": 0, "E": 0, "W": 0}
         self.phase_switches = 0
         self.prev_phase = 0
         self.episode_reward = 0
@@ -335,6 +373,7 @@ class SimulationBenchmark:
             frame_counts = self.spawn_schedule[frame_index]
             for d, count in frame_counts.items():
                 self.pending_spawns[d] += count
+                self.total_spawn_requested += count
 
         for d in ("N", "S", "E", "W"):
             while self.pending_spawns[d] > 0 and self._can_spawn(d):
@@ -361,6 +400,7 @@ class SimulationBenchmark:
 
     def _remove_done(self):
         to_remove = [c for c in self.cars if c.state == "done"]
+        self.total_red_wait_time_passed += sum(c.wait_time for c in to_remove)
         for _ in to_remove:
             self.total_cars_passed += 1
         self.cars = [c for c in self.cars if c.state != "done"]
@@ -380,11 +420,13 @@ class SimulationBenchmark:
                 waiting[d] += 1
 
         for d in ("N", "S", "E", "W"):
-            self.total_queue_length[d] += queue[d]
-            self.total_wait_time[d] += waiting[d]
+            pending = self.pending_spawns[d]
+            self.total_internal_queue_length[d] += queue[d]
+            self.total_queue_length[d] += queue[d] + pending
+            self.total_wait_time[d] += waiting[d] + pending
 
-        self.queue_length_history.append(sum(queue.values()))
-        self.waiting_cars_history.append(sum(waiting.values()))
+        self.queue_length_history.append(sum(queue.values()) + sum(self.pending_spawns.values()))
+        self.waiting_cars_history.append(sum(waiting.values()) + sum(self.pending_spawns.values()))
 
         current_phase = None
         if hasattr(self.tl, "phase"):
@@ -440,17 +482,24 @@ class SimulationBenchmark:
     def get_results(self):
         frames = self.frame
         avg_queue = sum(self.total_queue_length.values()) / max(frames, 1)
+        avg_internal_queue = sum(self.total_internal_queue_length.values()) / max(frames, 1)
         avg_waiting = sum(self.total_wait_time.values()) / max(frames, 1)
         max_queue = max(self.queue_length_history) if self.queue_length_history else 0
         max_waiting = max(self.waiting_cars_history) if self.waiting_cars_history else 0
 
         return {
-            "algorithm": "PPO" if self.use_rl else "Fixed Timing",
+            "algorithm": self.algorithm.upper() if self.use_rl else "Fixed Timing",
             "frames": frames,
+            "cars_requested": self.total_spawn_requested,
             "cars_spawned": self.total_cars_spawned,
             "cars_passed": self.total_cars_passed,
+            "pending_spawns": sum(self.pending_spawns.values()),
+            "remaining_cars": len(self.cars) + sum(self.pending_spawns.values()),
+            "completion_rate": self.total_cars_passed / max(self.total_cars_spawned, 1) * 100,
+            "avg_red_wait_time": self.total_red_wait_time_passed / max(self.total_cars_passed, 1),
             "throughput_rate": self.total_cars_passed / max(frames, 1) * 60,
             "avg_queue_length": avg_queue,
+            "avg_internal_queue_length": avg_internal_queue,
             "max_queue": max_queue,
             "avg_waiting_cars": avg_waiting,
             "max_waiting": max_waiting,
@@ -563,7 +612,8 @@ def main_dqn_train():
         nonlocal prev_passed, best_score, best_frame, best_saved
         nonlocal total_switches, last_switch_frame, avg_phase_len
 
-        reward = sim.step()
+        sim.step()
+        reward = sim.tl.last_reward
         frame_throughput = sim.total_cars_passed - prev_passed
         prev_passed = sim.total_cars_passed
 
@@ -642,12 +692,12 @@ def main_dqn_train():
     print(f"Final snapshot saved to {last_model_path}")
 
 
-def main_dqn_test(model_path="ppo_model.pth"):
-    """Chạy simulation với PPO đã train."""
+def main_dqn_test(model_path="ppo_model.pth", algorithm="ppo"):
+    """Chạy simulation với model RL đã train."""
     fig, ax = plt.subplots(figsize=(9, 9))
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
-    sim = SimulationRL(use_rl=True, training=False, model_path=model_path)
+    sim = SimulationRL(use_rl=True, training=False, model_path=model_path, algorithm=algorithm)
     sim.setup(fig, ax)
 
     for d, n in (("N", 3), ("S", 3), ("E", 3), ("W", 3)):
@@ -692,7 +742,8 @@ def main_dqn_test(model_path="ppo_model.pth"):
 
     def animate(frame):
         nonlocal total_switches, last_switch_frame, avg_phase_len
-        reward = sim.step()
+        sim.step()
+        reward = sim.tl.last_reward
         action_str = "N/A" if sim.tl.last_action is None else ("KEEP" if sim.tl.last_action == 0 else "SWITCH")
         if sim.tl.last_switch_reason in switch_counts:
             switch_counts[sim.tl.last_switch_reason] += 1
@@ -718,43 +769,23 @@ def main_dqn_test(model_path="ppo_model.pth"):
     plt.show()
 
 
-def run_comparison(model_path="ppo_model.pth", dqn_label="PPO", seed=42):
-    """Chạy so sánh Fixed Timing và PPO."""
+def run_comparison(model_path="ppo_model.pth", dqn_label="PPO", seed=42, algorithm="ppo"):
+    """Chạy so sánh Fixed Timing và agent RL."""
     print("\n" + "=" * 70)
-    print("SO SÁNH HIỆU QUẢ: FIXED TIMING vs PPO")
+    print(f"SO SÁNH HIỆU QUẢ: FIXED TIMING vs {dqn_label}")
     print("=" * 70)
 
     if not os.path.exists(model_path):
         print(f"Lỗi: Không tìm thấy file {model_path}")
         print("Vui lòng chạy training trước (option 2 hoặc 4)")
-        return
+        return None
 
-    max_frames = 2000
+    max_frames = BENCHMARK_MAX_FRAMES
 
     print(f"\nChạy benchmark với {max_frames} frames...")
     print("-" * 50)
 
-    def build_spawn_schedule():
-        rng = random.Random(seed)
-        demand = DemandController(rng=rng)
-        schedule = []
-        for _ in range(max_frames):
-            demand.tick()
-            frame_counts = {}
-            for d in ("N", "S", "E", "W"):
-                p_base = demand.base_prob(d, {"N": 0.010, "S": 0.010, "E": 0.012, "W": 0.012})
-                p_burst = demand.burst_prob(d, 0.030)
-                count = 0
-                if rng.random() < p_base:
-                    count += 1
-                if rng.random() < p_burst:
-                    count += rng.randint(1, 3)
-                if count:
-                    frame_counts[d] = min(count, 3)
-            schedule.append(frame_counts)
-        return schedule
-
-    spawn_schedule = build_spawn_schedule()
+    spawn_schedule = build_benchmark_spawn_schedule(seed, max_frames)
 
     print("1. Đang chạy Fixed Timing...")
     rng_fixed = random.Random(seed)
@@ -776,6 +807,7 @@ def run_comparison(model_path="ppo_model.pth", dqn_label="PPO", seed=42):
         max_frames=max_frames,
         rng=rng_dqn,
         spawn_schedule=spawn_schedule,
+        algorithm=algorithm,
     )
     sim_dqn.run()
     results_dqn = sim_dqn.get_results()
@@ -786,10 +818,16 @@ def run_comparison(model_path="ppo_model.pth", dqn_label="PPO", seed=42):
     print("=" * 70)
     print(f"{'Metric':<30} {'Fixed Timing':>18} {dqn_label:>18}")
     print("-" * 70)
+    print(f"{'Tổng yêu cầu spawn':<30} {results_fixed['cars_requested']:>18} {results_dqn['cars_requested']:>18}")
     print(f"{'Tổng xe spawn':<30} {results_fixed['cars_spawned']:>18} {results_dqn['cars_spawned']:>18}")
     print(f"{'Tổng xe đi qua':<30} {results_fixed['cars_passed']:>18} {results_dqn['cars_passed']:>18}")
+    print(f"{'Xe còn chờ spawn':<30} {results_fixed['pending_spawns']:>18} {results_dqn['pending_spawns']:>18}")
+    print(f"{'Xe còn trong hệ thống':<30} {results_fixed['remaining_cars']:>18} {results_dqn['remaining_cars']:>18}")
+    print(f"{'Tỷ lệ hoàn tất (%)':<30} {results_fixed['completion_rate']:>18.2f} {results_dqn['completion_rate']:>18.2f}")
+    print(f"{'Thời gian chờ đỏ TB':<30} {results_fixed['avg_red_wait_time']:>18.2f} {results_dqn['avg_red_wait_time']:>18.2f}")
     print(f"{'Throughput (xe/phút)':<30} {results_fixed['throughput_rate']:>18.2f} {results_dqn['throughput_rate']:>18.2f}")
     print(f"{'Độ dài hàng đợi TB':<30} {results_fixed['avg_queue_length']:>18.2f} {results_dqn['avg_queue_length']:>18.2f}")
+    print(f"{'Hàng đợi nội bộ TB':<30} {results_fixed['avg_internal_queue_length']:>18.2f} {results_dqn['avg_internal_queue_length']:>18.2f}")
     print(f"{'Độ dài hàng đợi max':<30} {results_fixed['max_queue']:>18} {results_dqn['max_queue']:>18}")
     print(f"{'Xe đang chờ TB':<30} {results_fixed['avg_waiting_cars']:>18.2f} {results_dqn['avg_waiting_cars']:>18.2f}")
     print(f"{'Số lần chuyển phase':<30} {results_fixed['phase_switches']:>18} {results_dqn['phase_switches']:>18}")
@@ -813,6 +851,10 @@ def run_comparison(model_path="ppo_model.pth", dqn_label="PPO", seed=42):
     wait_pct = (wait_diff / max(results_fixed['avg_waiting_cars'], 0.001)) * 100
     print(f"• Xe chờ TB: {dqn_label} {'giảm' if wait_diff > 0 else 'tăng'} {abs(wait_pct):.1f}%")
 
+    red_wait_diff = results_fixed['avg_red_wait_time'] - results_dqn['avg_red_wait_time']
+    red_wait_pct = (red_wait_diff / max(results_fixed['avg_red_wait_time'], 0.001)) * 100
+    print(f"• Thời gian chờ đỏ TB: {dqn_label} {'giảm' if red_wait_diff > 0 else 'tăng'} {abs(red_wait_pct):.1f}%")
+
     print(f"• Số lần chuyển phase: Fixed={results_fixed['phase_switches']}, {dqn_label}={results_dqn['phase_switches']}")
     if results_dqn['phase_switches'] > results_fixed['phase_switches']:
         print(f"  → {dqn_label} linh hoạt hơn, chuyển phase nhiều hơn")
@@ -820,9 +862,10 @@ def run_comparison(model_path="ppo_model.pth", dqn_label="PPO", seed=42):
         print(f"  → {dqn_label} ổn định hơn, ít chuyển phase hơn")
 
     print("\n" + "=" * 70)
+    return results_fixed, results_dqn
 
 
-def run_comparison_multi_seed(model_path="ppo_model.pth", dqn_label="PPO", seeds=None):
+def run_comparison_multi_seed(model_path="ppo_model.pth", dqn_label="PPO", seeds=None, algorithm="ppo"):
     if seeds is None:
         seeds = [42, 43, 44, 45, 46]
 
@@ -838,46 +881,18 @@ def run_comparison_multi_seed(model_path="ppo_model.pth", dqn_label="PPO", seeds
         print("\n" + "-" * 70)
         print(f"Seed {seed}")
         print("-" * 70)
-        run_comparison(model_path=model_path, dqn_label=dqn_label, seed=seed)
-
-        rng_fixed = random.Random(seed)
-        rng_dqn = random.Random(seed)
-        max_frames = 2000
-        spawn_schedule = []
-        demand = DemandController(rng=random.Random(seed))
-        for _ in range(max_frames):
-            demand.tick()
-            frame_counts = {}
-            for d in ("N", "S", "E", "W"):
-                p_base = demand.base_prob(d, {"N": 0.010, "S": 0.010, "E": 0.012, "W": 0.012})
-                p_burst = demand.burst_prob(d, 0.030)
-                count = 0
-                if rng_fixed.random() < p_base:
-                    count += 1
-                if rng_fixed.random() < p_burst:
-                    count += rng_fixed.randint(1, 3)
-                if count:
-                    frame_counts[d] = min(count, 3)
-            spawn_schedule.append(frame_counts)
-
-        sim_fixed = SimulationBenchmark(
-            use_rl=False,
-            max_frames=max_frames,
-            rng=rng_fixed,
-            spawn_schedule=spawn_schedule,
-        )
-        sim_fixed.run()
-        fixed_results.append(sim_fixed.get_results())
-
-        sim_dqn = SimulationBenchmark(
-            use_rl=True,
+        result_pair = run_comparison(
             model_path=model_path,
-            max_frames=max_frames,
-            rng=rng_dqn,
-            spawn_schedule=spawn_schedule,
+            dqn_label=dqn_label,
+            seed=seed,
+            algorithm=algorithm,
         )
-        sim_dqn.run()
-        dqn_results.append(sim_dqn.get_results())
+        if result_pair is None:
+            return
+
+        results_fixed, results_dqn = result_pair
+        fixed_results.append(results_fixed)
+        dqn_results.append(results_dqn)
 
     def mean(values):
         return sum(values) / max(len(values), 1)
@@ -886,9 +901,15 @@ def run_comparison_multi_seed(model_path="ppo_model.pth", dqn_label="PPO", seeds
         return {
             "throughput_rate": mean([r["throughput_rate"] for r in results]),
             "avg_queue_length": mean([r["avg_queue_length"] for r in results]),
+            "avg_internal_queue_length": mean([r["avg_internal_queue_length"] for r in results]),
             "avg_waiting_cars": mean([r["avg_waiting_cars"] for r in results]),
+            "cars_requested": mean([r["cars_requested"] for r in results]),
             "cars_spawned": mean([r["cars_spawned"] for r in results]),
             "cars_passed": mean([r["cars_passed"] for r in results]),
+            "pending_spawns": mean([r["pending_spawns"] for r in results]),
+            "remaining_cars": mean([r["remaining_cars"] for r in results]),
+            "completion_rate": mean([r["completion_rate"] for r in results]),
+            "avg_red_wait_time": mean([r["avg_red_wait_time"] for r in results]),
         }
 
     fixed_mean = summarize(fixed_results)
@@ -899,10 +920,16 @@ def run_comparison_multi_seed(model_path="ppo_model.pth", dqn_label="PPO", seeds
     print("=" * 70)
     print(f"{'Metric':<30} {'Fixed Timing':>18} {dqn_label:>18}")
     print("-" * 70)
+    print(f"{'Tổng yêu cầu spawn':<30} {fixed_mean['cars_requested']:>18.2f} {dqn_mean['cars_requested']:>18.2f}")
     print(f"{'Tổng xe spawn':<30} {fixed_mean['cars_spawned']:>18.2f} {dqn_mean['cars_spawned']:>18.2f}")
     print(f"{'Tổng xe đi qua':<30} {fixed_mean['cars_passed']:>18.2f} {dqn_mean['cars_passed']:>18.2f}")
+    print(f"{'Xe còn chờ spawn':<30} {fixed_mean['pending_spawns']:>18.2f} {dqn_mean['pending_spawns']:>18.2f}")
+    print(f"{'Xe còn trong hệ thống':<30} {fixed_mean['remaining_cars']:>18.2f} {dqn_mean['remaining_cars']:>18.2f}")
+    print(f"{'Tỷ lệ hoàn tất (%)':<30} {fixed_mean['completion_rate']:>18.2f} {dqn_mean['completion_rate']:>18.2f}")
+    print(f"{'Thời gian chờ đỏ TB':<30} {fixed_mean['avg_red_wait_time']:>18.2f} {dqn_mean['avg_red_wait_time']:>18.2f}")
     print(f"{'Throughput (xe/phút)':<30} {fixed_mean['throughput_rate']:>18.2f} {dqn_mean['throughput_rate']:>18.2f}")
     print(f"{'Độ dài hàng đợi TB':<30} {fixed_mean['avg_queue_length']:>18.2f} {dqn_mean['avg_queue_length']:>18.2f}")
+    print(f"{'Hàng đợi nội bộ TB':<30} {fixed_mean['avg_internal_queue_length']:>18.2f} {dqn_mean['avg_internal_queue_length']:>18.2f}")
     print(f"{'Xe đang chờ TB':<30} {fixed_mean['avg_waiting_cars']:>18.2f} {dqn_mean['avg_waiting_cars']:>18.2f}")
     print("=" * 70)
 
@@ -920,9 +947,12 @@ def main():
     print("6. PPO Testing (ppo_model_last.pth)")
     print("7. Compare Benchmark (Fixed vs ppo_model_last)")
     print("8. Compare Benchmark (nhiều seed)")
+    print("9. DQN Testing (dqn_model.pth)")
+    print("10. Compare Benchmark (Fixed vs DQN)")
+    print("11. Compare Benchmark (DQN nhiều seed)")
     print("=" * 50)
 
-    choice = input("Chọn chế độ (1/2/3/4/5/6/7): ").strip()
+    choice = input("Chọn chế độ (1-11): ").strip()
 
     if choice == "1":
         main_fixed_timing()
@@ -947,6 +977,12 @@ def main():
         run_comparison(model_path="ppo_model_last.pth", dqn_label="PPO(last)")
     elif choice == "8":
         run_comparison_multi_seed(model_path="ppo_model.pth", dqn_label="PPO(best)")
+    elif choice == "9":
+        main_dqn_test(model_path="dqn_model.pth", algorithm="dqn")
+    elif choice == "10":
+        run_comparison(model_path="dqn_model.pth", dqn_label="DQN", algorithm="dqn")
+    elif choice == "11":
+        run_comparison_multi_seed(model_path="dqn_model.pth", dqn_label="DQN", algorithm="dqn")
     else:
         print("Lựa chọn không hợp lệ. Chạy chế độ PPO Training mặc định.")
         main_dqn_train()
